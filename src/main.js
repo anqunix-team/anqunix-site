@@ -1,3 +1,5 @@
+import "./styles.css";
+
 const menuToggle = document.querySelector(".menu-toggle");
 const navigation = document.querySelector(".navigation");
 const currentYear = document.querySelector("#current-year");

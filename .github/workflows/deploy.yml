@@ -1,0 +1,95 @@
+name: Deploy to AWS Amplify
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-amplify
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AMPLIFY_APP_ID: ${{ vars.AMPLIFY_APP_ID }}
+  AMPLIFY_BRANCH: main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Zip build output
+        run: cd dist && zip -r ../dist.zip .
+
+      - name: Create Amplify deployment
+        id: create
+        run: |
+          result=$(aws amplify create-deployment \
+            --app-id "$AMPLIFY_APP_ID" \
+            --branch-name "$AMPLIFY_BRANCH" \
+            --output json)
+          echo "job_id=$(echo "$result" | jq -r .jobId)" >> "$GITHUB_OUTPUT"
+          echo "upload_url=$(echo "$result" | jq -r .zipUploadUrl)" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$(echo "$result" | jq -r .zipUploadUrl)"
+
+      - name: Upload artifact to Amplify
+        run: |
+          curl --fail --silent --show-error \
+            --upload-file dist.zip \
+            "${{ steps.create.outputs.upload_url }}"
+
+      - name: Start deployment
+        run: |
+          aws amplify start-deployment \
+            --app-id "$AMPLIFY_APP_ID" \
+            --branch-name "$AMPLIFY_BRANCH" \
+            --job-id "${{ steps.create.outputs.job_id }}"
+
+      - name: Wait for deployment to finish
+        run: |
+          for i in $(seq 1 60); do
+            status=$(aws amplify get-job \
+              --app-id "$AMPLIFY_APP_ID" \
+              --branch-name "$AMPLIFY_BRANCH" \
+              --job-id "${{ steps.create.outputs.job_id }}" \
+              --query 'job.summary.status' --output text)
+            echo "Status: $status"
+            case "$status" in
+              SUCCEED) exit 0 ;;
+              FAILED|CANCELLED) exit 1 ;;
+            esac
+            sleep 5
+          done
+          echo "Timed out waiting for deployment" && exit 1
